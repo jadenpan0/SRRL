@@ -14,6 +14,21 @@ from accelerate.logging import get_logger
 from diffusers import StableDiffusionPipeline, DDIMScheduler, UNet2DConditionModel, DDIMInverseScheduler
 from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
+from diffusers.loaders import AttnProcsLayers
+from diffusers.models.attention_processor import LoRAAttnProcessor
+from diffusion.ddim_with_logprob import ddim_step_with_logprob
+from diffusers.training_utils import _set_state_dict_into_text_encoder, cast_training_params, compute_snr
+from diffusers.utils.torch_utils import is_compiled_module
+from diffusers.utils import (
+    check_min_version,
+    convert_state_dict_to_diffusers,
+    convert_unet_state_dict_to_peft,
+    is_wandb_available,
+)
+from diffusers.loaders import StableDiffusionLoraLoaderMixin
+from peft import LoraConfig, set_peft_model_state_dict
+from peft.utils import get_peft_model_state_dict
+
 import numpy as np
 # from diffusion.pipeline_with_logprob import pipeline_with_logprob
 from diffusion.ddim_with_logprob import ddim_step_with_logprob, latents_decode
@@ -37,8 +52,44 @@ config_flags.DEFINE_config_file("config", "config/stage_process.py", "Sampling c
 
 logger = get_logger(__name__)
 
-
 def run_sample_main():
+    def tokenize_prompt(tokenizer, prompt):
+        text_inputs = tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids
+        return text_input_ids
+
+    def encode_prompt(text_encoders, tokenizers, prompt, text_input_ids_list=None):
+        prompt_embeds_list = []
+
+        for i, text_encoder in enumerate(text_encoders):
+            if tokenizers is not None:
+                tokenizer = tokenizers[i]
+                text_input_ids = tokenize_prompt(tokenizer, prompt)
+            else:
+                assert text_input_ids_list is not None
+                text_input_ids = text_input_ids_list[i]
+
+            prompt_embeds = text_encoder(
+                text_input_ids.to(text_encoder.device), output_hidden_states=True, return_dict=False
+            )
+
+            # We are only ALWAYS interested in the pooled output of the final text encoder
+            pooled_prompt_embeds = prompt_embeds[0]
+            prompt_embeds = prompt_embeds[-1][-2]
+            bs_embed, seq_len, _ = prompt_embeds.shape
+            prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
+            prompt_embeds_list.append(prompt_embeds)
+
+        prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+        pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
+        return prompt_embeds, pooled_prompt_embeds
+
     # basic Accelerate and logging setup
     config = FLAGS.config
     debug_idx = 0
@@ -87,12 +138,15 @@ def run_sample_main():
 
     # load scheduler, tokenizer and models.
     ####################################
-    pipeline = StableDiffusionPipeline.from_pretrained(config.pretrained.model, torch_dtype=torch.float16) # float16
+    pipeline = StableDiffusionXLPipeline.from_pretrained(config.pretrained.model, torch_dtype=torch.float16) # float16
     inv_scheduler = DDIMInverseScheduler.from_config(pipeline.scheduler.config)
     # pipeline = StableDiffusionPipeline.from_single_file(config.pretrained.model, torch_dtype=torch.float16)
     # freeze parameters of models to save more memory
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
+    pipeline.text_encoder_2.requires_grad_(False)
+    #pipeline.tokenizer.requires_grad_(False)
+    #pipeline.tokenizer_2.requires_grad_(False)
     pipeline.unet.requires_grad_(False)
     # disable safety checker
     pipeline.safety_checker = None
@@ -118,66 +172,97 @@ def run_sample_main():
 
     # Move unet, vae and text_encoder to device and cast to inference_dtype
     pipeline.vae.to(accelerator.device, dtype=inference_dtype)
+    #pipeline.vae.to(accelerator.device)
     pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
+    pipeline.text_encoder_2.to(accelerator.device, dtype=inference_dtype)
+    
+    rank=4
+    unet_lora_config = LoraConfig(
+        r=rank,
+        lora_alpha=rank,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+    )
     
     if config.use_lora:
         pipeline.unet.to(accelerator.device, dtype=inference_dtype)
 
     if config.use_lora:
-        # Set correct lora layers
-        lora_attn_procs = {}
-        for name in pipeline.unet.attn_processors.keys():
-            cross_attention_dim = (
-                None if name.endswith("attn1.processor") else pipeline.unet.config.cross_attention_dim
-            )
-            if name.startswith("mid_block"):
-                hidden_size = pipeline.unet.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(pipeline.unet.config.block_out_channels))[block_id]
-            elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
-                hidden_size = pipeline.unet.config.block_out_channels[block_id]
+        pipeline.unet.add_adapter(unet_lora_config)
 
-            lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
-
-        pipeline.unet.set_attn_processor(lora_attn_procs)
-        trainable_layers = AttnProcsLayers(pipeline.unet.attn_processors)
-    else:
-        trainable_layers = pipeline.unet
-
-    ###############################################################
-    # set up diffusers-friendly checkpoint saving with Accelerate
-
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
     def save_model_hook(models, weights, output_dir):
-        assert len(models) == 1
-        if config.use_lora and isinstance(models[0], AttnProcsLayers):
-            pipeline.unet.save_attn_procs(output_dir)
-        elif not config.use_lora and isinstance(models[0], UNet2DConditionModel):
-            models[0].save_pretrained(os.path.join(output_dir, "unet"))
-        else:
-            raise ValueError(f"Unknown model type {type(models[0])}")
-        weights.pop()  # ensures that accelerate doesn't try to handle saving of the model
+        if accelerator.is_main_process:
+            # there are only two options here. Either are just the unet attn processor layers
+            # or there are the unet and text encoder attn layers
+            unet_lora_layers_to_save = None
+            text_encoder_one_lora_layers_to_save = None
+            text_encoder_two_lora_layers_to_save = None
+
+            for model in models:
+                if isinstance(unwrap_model(model), type(unwrap_model(pipeline.unet))):
+                    unet_lora_layers_to_save = convert_state_dict_to_diffusers(get_peft_model_state_dict(model))
+                elif isinstance(unwrap_model(model), type(unwrap_model(pipeline.text_encoder))):
+                    text_encoder_one_lora_layers_to_save = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(model)
+                    )
+                elif isinstance(unwrap_model(model), type(unwrap_model(pipeline.text_encoder_2))):
+                    text_encoder_two_lora_layers_to_save = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(model)
+                    )
+                else:
+                    raise ValueError(f"unexpected save model: {model.__class__}")
+
+                # make sure to pop weight so that corresponding model is not saved again
+                if weights:
+                    weights.pop()
+
+            StableDiffusionXLPipeline.save_lora_weights(
+                output_dir,
+                unet_lora_layers=unet_lora_layers_to_save,
+                text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
+                text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
+            )
 
     def load_model_hook(models, input_dir):
-        assert len(models) == 1
-        # print(models)
-        if config.use_lora and isinstance(models[0], AttnProcsLayers):
-            tmp_unet = UNet2DConditionModel.from_pretrained(
-                config.pretrained.model, revision=config.pretrained.revision, subfolder="unet"
-            )
-            
-            tmp_unet.load_attn_procs(input_dir)
-            models[0].load_state_dict(AttnProcsLayers(tmp_unet.attn_processors).state_dict())
-            del tmp_unet
-        elif not config.use_lora and isinstance(models[0], UNet2DConditionModel):
-            load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
-            models[0].register_to_config(**load_model.config)
-            models[0].load_state_dict(load_model.state_dict())
-            del load_model
-        else:
-            raise ValueError(f"Unknown model type {type(models[0])}")
-        models.pop()  # ensures that accelerate doesn't try to handle loading of the model
+        unet_ = None
+        text_encoder_one_ = None
+        text_encoder_two_ = None
+
+        while len(models) > 0:
+            model = models.pop()
+
+            if isinstance(model, type(unwrap_model(pipeline.unet))):
+                unet_ = model
+            elif isinstance(model, type(unwrap_model(pipeline.text_encoder))):
+                text_encoder_one_ = model
+            elif isinstance(model, type(unwrap_model(pipeline.text_encoder_2))):
+                text_encoder_two_ = model
+            else:
+                raise ValueError(f"unexpected save model: {model.__class__}")
+
+        lora_state_dict, _ = StableDiffusionLoraLoaderMixin.lora_state_dict(input_dir)
+        unet_state_dict = {f"{k.replace('unet.', '')}": v for k, v in lora_state_dict.items() if k.startswith("unet.")}
+        unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
+        incompatible_keys = set_peft_model_state_dict(unet_, unet_state_dict, adapter_name="default")
+        if incompatible_keys is not None:
+            # check only for unexpected keys
+            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+            if unexpected_keys:
+                logger.warning(
+                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
+                    f" {unexpected_keys}. "
+                )
+
+        # Make sure the trainable params are in float32. This is again needed since the base models
+        # are in `weight_dtype`. More details:
+        # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
+        if accelerator.mixed_precision == "fp16":
+            models = [unet_]
+            cast_training_params(models, dtype=torch.float32)
     
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
@@ -187,21 +272,16 @@ def run_sample_main():
     if config.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    # generate negative prompt embeddings
-    neg_prompt_embed = pipeline.text_encoder(
-        pipeline.tokenizer(
-            [""],
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=pipeline.tokenizer.model_max_length,
-        ).input_ids.to(accelerator.device)
-    )[0]
-    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.batch_size, 1, 1)
+    # Define tokenizers and text encoders
+    tokenizers = [pipeline.tokenizer, pipeline.tokenizer_2] if pipeline.tokenizer is not None else [pipeline.tokenizer_2]
+    text_encoders = (
+        [pipeline.text_encoder, pipeline.text_encoder_2] if pipeline.text_encoder is not None else [pipeline.text_encoder_2]
+    )
+    
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
 
     # Prepare everything with our `accelerator`.
-    trainable_layers = accelerator.prepare(trainable_layers)
+    pipeline.unet = accelerator.prepare(pipeline.unet)
 
     if config.resume_from:
         logger.info(f"Resuming from {config.resume_from}")
@@ -247,27 +327,10 @@ def run_sample_main():
         else:
             prompts1 = [prompt_list[(prompt_idx+i)%prompt_cnt] for i in range(config.sample.batch_size)] 
             prompt_idx += config.sample.batch_size
-        # encode prompts
-        prompt_ids1 = pipeline.tokenizer(
-            prompts1,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=pipeline.tokenizer.model_max_length,
-        ).input_ids.to(accelerator.device)
+        
+        prompt_embeds1,negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds=pipeline.encode_prompt(prompts1,None, accelerator.device)
 
-        prompt_embeds1 = pipeline.text_encoder(prompt_ids1)[0]
-
-        # combine prompt and neg_prompt
-        prompt_embeds1_combine = pipeline._encode_prompt(
-            None,
-            accelerator.device,
-            1,
-            config.sample.cfg,
-            None,
-            prompt_embeds=prompt_embeds1,
-            negative_prompt_embeds=sample_neg_prompt_embeds
-        )
+        saved_add_text_embeds=pooled_prompt_embeds
 
         noise_latents1 = pipeline.prepare_latents(
             config.sample.batch_size, 
@@ -279,16 +342,46 @@ def run_sample_main():
             None ## generator
         )
 
+        # 7. Prepare added time ids & embeddings
+        add_text_embeds = pooled_prompt_embeds
+        if pipeline.text_encoder_2 is None:
+            text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
+        else:
+            text_encoder_projection_dim = pipeline.text_encoder_2.config.projection_dim
+
+        height = pipeline.default_sample_size * pipeline.vae_scale_factor
+        width = pipeline.default_sample_size * pipeline.vae_scale_factor
+        original_size =  (height, width)
+        target_size =  (height, width)
+
+        add_time_ids = pipeline._get_add_time_ids(
+            original_size,
+            (0, 0),
+            target_size,
+            dtype=prompt_embeds1.dtype,
+            text_encoder_projection_dim=text_encoder_projection_dim,
+        )
+        negative_add_time_ids = add_time_ids
+
+        prompt_embeds1_combine = torch.cat([negative_prompt_embeds, prompt_embeds1], dim=0)
+        add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+        add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
+
+        prompt_embeds1_combine = prompt_embeds1_combine.to(accelerator.device)
+        add_text_embeds = add_text_embeds.to(accelerator.device)
+        add_time_ids = add_time_ids.to(accelerator.device).repeat(config.sample.batch_size, 1, 1)
+
         pipeline.scheduler.set_timesteps(config.sample.num_steps, device=accelerator.device)
         inv_scheduler.set_timesteps(config.sample.num_steps, device=accelerator.device)
 
-        #@torch.no_grad()
+        @torch.no_grad()
         def prepare_resample_noise_latent(noise_latents1, resample_num, forward_guidance_scale=3.0, backward_guidance_scale=0.1):
             latents=noise_latents1
             forward_timesteps=pipeline.scheduler.timesteps
             backward_timesteps=torch.flip(forward_timesteps, [0]).to(accelerator.device)
             extra_step_kwargs={"eta": 0.0, "generator": None}
             #backward_timesteps=forward_timesteps[::-1]
+            added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
             for _ in range(resample_num):
                 for i,t in enumerate(forward_timesteps):
                     latents_input = torch.cat([latents] * 2) if forward_guidance_scale else latents
@@ -297,6 +390,7 @@ def run_sample_main():
                             latents_input,
                             t,
                             encoder_hidden_states=prompt_embeds1_combine,
+                            added_cond_kwargs=added_cond_kwargs,
                             return_dict=False,
                         )[0]
                     if forward_guidance_scale:
@@ -310,6 +404,7 @@ def run_sample_main():
                             latents_input,
                             t,
                             encoder_hidden_states=prompt_embeds1_combine,
+                            added_cond_kwargs=added_cond_kwargs,
                             return_dict=False,
                         )[0]
                     if backward_guidance_scale:
@@ -317,7 +412,8 @@ def run_sample_main():
                         noise_pred = noise_pred_uncond + backward_guidance_scale * (noise_pred_text - noise_pred_uncond)
                     inv_latents = inv_scheduler.step(noise_pred, backward_timesteps[i], latents, return_dict=False)[0]
                     latents = inv_latents
-            return latents
+            #print(latents.dtype)
+            return latents.type(torch.float16)
         
         noise_latents1=prepare_resample_noise_latent(noise_latents1, config.resample_num)
             
@@ -359,10 +455,13 @@ def run_sample_main():
                         latents_input = torch.cat([latents_t] * 2) if config.sample.cfg else latents_t
                         latents_input = pipeline.scheduler.scale_model_input(latents_input, t)
 
+                        added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                        #print(add_text_embeds.shape, add_time_ids.shape, prompt_embeds1_combine.shape)
                         noise_pred = pipeline.unet(
                             latents_input,
                             t,
                             encoder_hidden_states=prompt_embeds1_combine,
+                            added_cond_kwargs=added_cond_kwargs,
                             return_dict=False,
                         )[0]
 
@@ -371,14 +470,14 @@ def run_sample_main():
                             noise_pred = noise_pred_uncond + config.sample.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                         latents_t_1, log_prob, latents_0 = ddim_step_with_logprob(pipeline.scheduler, noise_pred, t, latents_t, **extra_step_kwargs)
-
+                        
                         latents[k].append(latents_t_1)
                         log_probs[k].append(log_prob)
 
         sample_num = len(latents)
         total_prompts.extend(prompts1*sample_num)
 
-        for k in range(sample_num): 
+        for k in range(sample_num):    
             images = latents_decode(pipeline, latents[k][config.sample.num_steps], accelerator.device, prompt_embeds1.dtype)
             store_latents = torch.stack(latents[k], dim=1)  # (batch_size, num_steps + 1, 4, 64, 64)
             store_log_probs = torch.stack(log_probs[k], dim=1)  # (batch_size, num_steps)
@@ -394,7 +493,11 @@ def run_sample_main():
                     "log_probs": store_log_probs.cpu().detach(),
                     "latents": current_latents.cpu().detach(),  # each entry is the latent before timestep t
                     "next_latents": next_latents.cpu().detach(),  # each entry is the latent after timestep t
-                    "images":images.cpu().detach()
+                    "images":images.cpu().detach(),
+                    "add_text_embeds": add_text_embeds.cpu().detach().unsqueeze(0),
+                    "add_time_ids": add_time_ids.cpu().detach(),
+                    "prompt_embeds1_combine": prompt_embeds1_combine.cpu().detach().unsqueeze(0)
+                    #"images":images
                 }
             )
 
@@ -409,7 +512,8 @@ def run_sample_main():
             new_samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
             images = new_samples['images'][local_idx:]
             for j, image in enumerate(images):
-                pil = Image.fromarray((image.to(torch.float32).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
+                #pil = image
+                pil = Image.fromarray((image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
                 pil.save(os.path.join(save_dir, f"images/{(j+global_idx):05}.png"))
 
             global_idx += len(images)
@@ -423,7 +527,10 @@ def run_sample_main():
                         "timesteps": new_samples["timesteps"], 
                         "log_probs": new_samples["log_probs"], 
                         "latents": new_samples["latents"], 
-                        "next_latents": new_samples["next_latents"]
+                        "next_latents": new_samples["next_latents"],
+                        "add_text_embeds": new_samples["add_text_embeds"],
+                        "add_time_ids": new_samples["add_time_ids"],
+                        "prompt_embeds1_combine": new_samples["prompt_embeds1_combine"]
                         }, f)
                 else: 
                     pickle.dump({
@@ -431,9 +538,11 @@ def run_sample_main():
                         "timesteps": torch.cat([total_samples["timesteps"], new_samples["timesteps"]]), 
                         "log_probs": torch.cat([total_samples["log_probs"], new_samples["log_probs"]]), 
                         "latents": torch.cat([total_samples["latents"], new_samples["latents"]]), 
-                        "next_latents": torch.cat([total_samples["next_latents"], new_samples["next_latents"]])
-                        }, f)  
-
+                        "next_latents": torch.cat([total_samples["next_latents"], new_samples["next_latents"]]),
+                        "add_text_embeds": torch.cat([total_samples["add_text_embeds"], new_samples["add_text_embeds"]]),
+                        "add_time_ids": torch.cat([total_samples["add_time_ids"], new_samples["add_time_ids"]]),
+                        "prompt_embeds1_combine": torch.cat([total_samples["prompt_embeds1_combine"], new_samples["prompt_embeds1_combine"]])
+                        }, f)
 
 def run_select_main():
 
@@ -469,7 +578,10 @@ def run_select_main():
             'log_probs': [], 
             'latents': [], 
             'next_latents': [], 
-            'eval_scores': []
+            'eval_scores': [],
+            "add_text_embeds": [],
+            "add_time_ids": [],
+            'prompt_embeds1_combine':[]
         }
     data = get_new_unit()
 
@@ -487,6 +599,9 @@ def run_select_main():
         log_probs = batch_samples['log_probs'][torch.arange(0, data_size, cur_sample_num), t_left:t_right]
         latents = batch_samples['latents'][torch.arange(0, data_size, cur_sample_num), t_left:t_right]
         next_latents = batch_samples['next_latents'][torch.arange(0, data_size, cur_sample_num), t_left:t_right]
+        add_text_embeds = batch_samples['add_text_embeds'][torch.arange(0, data_size, cur_sample_num)]
+        add_time_ids = batch_samples['add_time_ids'][torch.arange(0, data_size, cur_sample_num)]
+        prompt_embeds1_combine= batch_samples['prompt_embeds1_combine'][torch.arange(0, data_size, cur_sample_num)]
 
         score = batch_samples['eval_scores'][torch.arange(0, data_size, cur_sample_num)]
         score = score.reshape(-1, config.split_time)
@@ -510,6 +625,9 @@ def run_select_main():
                 data['latents'].append(latents[used_idx_2])
                 data['next_latents'].append(next_latents[used_idx_2])
                 data['eval_scores'].append(s[used_idx])
+                data['add_text_embeds'].append(add_text_embeds[used_idx_2])
+                data['add_time_ids'].append(add_time_ids[used_idx_2])
+                data['prompt_embeds1_combine'].append(prompt_embeds1_combine[used_idx_2])
 
         cur_sample_num *= config.split_time
 
@@ -572,17 +690,18 @@ def run_train_main():
     )
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name="srrl", config=config.to_dict(), init_kwargs={"wandb": {"name": unique_id+"_"+stage_id}}
+            project_name="d3po-pytorch", config=config.to_dict(), init_kwargs={"wandb": {"name": unique_id+"_"+stage_id}}
         )
     logger.info(f"\n{config}")
 
     seed_everything(config.seed)
 
     # load scheduler, tokenizer and models.
-    pipeline = StableDiffusionPipeline.from_pretrained(config.pretrained.model, torch_dtype=torch.float16) ## float16
+    pipeline = StableDiffusionXLPipeline.from_pretrained(config.pretrained.model, torch_dtype=torch.float16) ## float16
     # freeze parameters of models to save more memory
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
+    pipeline.text_encoder_2.requires_grad_(False)
     pipeline.unet.requires_grad_(not config.use_lora)
     # disable safety checker
     pipeline.safety_checker = None
@@ -608,62 +727,97 @@ def run_train_main():
     # Move unet, vae and text_encoder to device and cast to inference_dtype
     pipeline.vae.to(accelerator.device, dtype=inference_dtype)
     pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
+    pipeline.text_encoder_2.to(accelerator.device, dtype=inference_dtype)
     
+    rank=4
+    unet_lora_config = LoraConfig(
+        r=rank,
+        lora_alpha=rank,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+    )
+
     if config.use_lora:
         pipeline.unet.to(accelerator.device, dtype=inference_dtype)
     
-        
     if config.use_lora:
-        # Set correct lora layers
-        lora_attn_procs = {}
-        for name in pipeline.unet.attn_processors.keys():
-            cross_attention_dim = (
-                None if name.endswith("attn1.processor") else pipeline.unet.config.cross_attention_dim
-            )
-            if name.startswith("mid_block"):
-                hidden_size = pipeline.unet.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(pipeline.unet.config.block_out_channels))[block_id]
-            elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
-                hidden_size = pipeline.unet.config.block_out_channels[block_id]
-
-            lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
-        pipeline.unet.set_attn_processor(lora_attn_procs)
-        trainable_layers = AttnProcsLayers(pipeline.unet.attn_processors)
-    else:
-        trainable_layers = pipeline.unet
+        pipeline.unet.add_adapter(unet_lora_config)
 
     # set up diffusers-friendly checkpoint saving with Accelerate
 
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
     def save_model_hook(models, weights, output_dir):
-        assert len(models) == 1
-        if config.use_lora and isinstance(models[0], AttnProcsLayers):
-            pipeline.unet.save_attn_procs(output_dir)
-        elif not config.use_lora and isinstance(models[0], UNet2DConditionModel):
-            models[0].save_pretrained(os.path.join(output_dir, "unet"))
-        else:
-            raise ValueError(f"Unknown model type {type(models[0])}")
-        weights.pop()  # ensures that accelerate doesn't try to handle saving of the model
+        if accelerator.is_main_process:
+            # there are only two options here. Either are just the unet attn processor layers
+            # or there are the unet and text encoder attn layers
+            unet_lora_layers_to_save = None
+            text_encoder_one_lora_layers_to_save = None
+            text_encoder_two_lora_layers_to_save = None
+
+            for model in models:
+                if isinstance(unwrap_model(model), type(unwrap_model(pipeline.unet))):
+                    unet_lora_layers_to_save = convert_state_dict_to_diffusers(get_peft_model_state_dict(model))
+                elif isinstance(unwrap_model(model), type(unwrap_model(pipeline.text_encoder))):
+                    text_encoder_one_lora_layers_to_save = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(model)
+                    )
+                elif isinstance(unwrap_model(model), type(unwrap_model(pipeline.text_encoder_2))):
+                    text_encoder_two_lora_layers_to_save = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(model)
+                    )
+                else:
+                    raise ValueError(f"unexpected save model: {model.__class__}")
+
+                # make sure to pop weight so that corresponding model is not saved again
+                if weights:
+                    weights.pop()
+
+            StableDiffusionXLPipeline.save_lora_weights(
+                output_dir,
+                unet_lora_layers=unet_lora_layers_to_save,
+                text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
+                text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
+            )
 
     def load_model_hook(models, input_dir):
-        assert len(models) == 1
-        if config.use_lora and isinstance(models[0], AttnProcsLayers):
-            tmp_unet = UNet2DConditionModel.from_pretrained(
-                config.pretrained.model, revision=config.pretrained.revision, subfolder="unet"
-            )
-            tmp_unet.load_attn_procs(input_dir)
-            models[0].load_state_dict(AttnProcsLayers(tmp_unet.attn_processors).state_dict())
-            del tmp_unet
-        elif not config.use_lora and isinstance(models[0], UNet2DConditionModel):
-            load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
-            models[0].register_to_config(**load_model.config)
-            models[0].load_state_dict(load_model.state_dict())
-            del load_model
-        else:
-            raise ValueError(f"Unknown model type {type(models[0])}")
-        models.pop()  # ensures that accelerate doesn't try to handle loading of the model
+        unet_ = None
+        text_encoder_one_ = None
+        text_encoder_two_ = None
+
+        while len(models) > 0:
+            model = models.pop()
+
+            if isinstance(model, type(unwrap_model(pipeline.unet))):
+                unet_ = model
+            elif isinstance(model, type(unwrap_model(pipeline.text_encoder))):
+                text_encoder_one_ = model
+            elif isinstance(model, type(unwrap_model(pipeline.text_encoder_2))):
+                text_encoder_two_ = model
+            else:
+                raise ValueError(f"unexpected save model: {model.__class__}")
+
+        lora_state_dict, _ = StableDiffusionLoraLoaderMixin.lora_state_dict(input_dir)
+        unet_state_dict = {f"{k.replace('unet.', '')}": v for k, v in lora_state_dict.items() if k.startswith("unet.")}
+        unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
+        incompatible_keys = set_peft_model_state_dict(unet_, unet_state_dict, adapter_name="default")
+        if incompatible_keys is not None:
+            # check only for unexpected keys
+            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+            if unexpected_keys:
+                logger.warning(
+                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
+                    f" {unexpected_keys}. "
+                )
+
+        # Make sure the trainable params are in float32. This is again needed since the base models
+        # are in `weight_dtype`. More details:
+        # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
+        if accelerator.mixed_precision == "fp16":
+            models = [unet_]
+            cast_training_params(models, dtype=torch.float32)
     
 
     accelerator.register_save_state_pre_hook(save_model_hook)
@@ -687,30 +841,63 @@ def run_train_main():
     else:
         optimizer_cls = torch.optim.AdamW
 
+    params_to_optimize = list(filter(lambda p: p.requires_grad, pipeline.unet.parameters()))
+    for param in pipeline.unet.parameters():
+        if param.requires_grad:
+            param.data = param.data.float()
     optimizer = optimizer_cls(
-        trainable_layers.parameters(),
+        params_to_optimize,
         lr=config.train.learning_rate,
         betas=(config.train.adam_beta1, config.train.adam_beta2),
         weight_decay=config.train.adam_weight_decay,
         eps=config.train.adam_epsilon,
     )
 
-    # generate negative prompt embeddings
-    neg_prompt_embed = pipeline.text_encoder(
-        pipeline.tokenizer(
-            [""],
-            return_tensors="pt",
+    def tokenize_prompt(tokenizer, prompt):
+        text_inputs = tokenizer(
+            prompt,
             padding="max_length",
+            max_length=tokenizer.model_max_length,
             truncation=True,
-            max_length=pipeline.tokenizer.model_max_length,
-        ).input_ids.to(accelerator.device)
-    )[0]
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids
+        return text_input_ids
+    
+        # Adapted from pipelines.StableDiffusionXLPipeline.encode_prompt
+    def encode_prompt(text_encoders, tokenizers, prompt, text_input_ids_list=None):
+        prompt_embeds_list = []
+
+        for i, text_encoder in enumerate(text_encoders):
+            if tokenizers is not None:
+                tokenizer = tokenizers[i]
+                text_input_ids = tokenize_prompt(tokenizer, prompt)
+            else:
+                assert text_input_ids_list is not None
+                text_input_ids = text_input_ids_list[i]
+
+            prompt_embeds = text_encoder(
+                text_input_ids.to(text_encoder.device), output_hidden_states=True, return_dict=False
+            )
+
+            # We are only ALWAYS interested in the pooled output of the final text encoder
+            pooled_prompt_embeds = prompt_embeds[0]
+            prompt_embeds = prompt_embeds[-1][-2]
+            bs_embed, seq_len, _ = prompt_embeds.shape
+            prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
+            prompt_embeds_list.append(prompt_embeds)
+
+        prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+        pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
+        return prompt_embeds, pooled_prompt_embeds
+
+    neg_prompt_embed,_= encode_prompt([pipeline.text_encoder, pipeline.text_encoder_2], [pipeline.tokenizer, pipeline.tokenizer_2], "")
     train_neg_prompt_embeds = neg_prompt_embed.repeat(config.train.batch_size, 1, 1)
 
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
 
     # Prepare everything with our `accelerator`.
-    trainable_layers, optimizer = accelerator.prepare(trainable_layers, optimizer)
+    pipeline.unet, optimizer = accelerator.prepare(pipeline.unet, optimizer)
 
     # Train!
     samples_per_epoch = config.sample.batch_size * accelerator.num_processes * config.sample.num_batches_per_epoch
@@ -776,9 +963,11 @@ def run_train_main():
 
             # cfg, classifier-free-guidance
             if config.train.cfg:
-                embeds = torch.cat([train_neg_prompt_embeds, sample["prompt_embeds"]])
+                #embeds = torch.cat([train_neg_prompt_embeds, sample["prompt_embeds"]])
+                embeds= sample["prompt_embeds1_combine"]
             else:
                 embeds = sample["prompt_embeds"]
+            #embeds = sample["prompt_embeds"]
             
             for t in tqdm(
                 range(sample["timesteps"].shape[1]),
@@ -793,10 +982,15 @@ def run_train_main():
                 with accelerator.accumulate(pipeline.unet):
                     with autocast():
                         if config.train.cfg:
+                            unet_added_conditions = {"time_ids": sample["add_time_ids"],"text_embeds":sample["add_text_embeds"][0]}
+                            #print(sample["add_time_ids"].shape, sample["add_text_embeds"][0].shape,embeds.shape)
                             noise_pred = pipeline.unet(
                                 torch.cat([sample["latents"][:, t]] * 2),
-                                torch.cat([sample["timesteps"][:, t]] * 2),
-                                embeds,
+                                #sample["latents"][:, t],
+                                #torch.cat([sample["timesteps"][:, t]] * 2),
+                                sample["timesteps"][:, t],
+                                encoder_hidden_states=embeds[0],
+                                added_cond_kwargs=unet_added_conditions
                             ).sample
                             
                             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -804,7 +998,7 @@ def run_train_main():
 
                         else:
                             noise_pred = pipeline.unet(
-                                sample["latents"][:, t], sample["timesteps"][:, t], embeds
+                                sample["latents"][:, t], sample["timesteps"][:, t], embeds, added_cond_kwargs=unet_added_conditions
                             ).sample
 
                         _, total_prob, _ = ddim_step_with_logprob(
@@ -837,7 +1031,7 @@ def run_train_main():
                 accelerator.backward(loss)
                 total_norm = None
                 if accelerator.sync_gradients:
-                    total_norm = accelerator.clip_grad_norm_(trainable_layers.parameters(), config.train.max_grad_norm)
+                    total_norm = accelerator.clip_grad_norm_(params_to_optimize, config.train.max_grad_norm)
                 LossRecord[epoch][idx//config.train.batch_size].append(loss.cpu().item())
                 GradRecord[epoch][idx//config.train.batch_size].append(total_norm.cpu().item() if total_norm is not None else None)
                 optimizer.step()
@@ -851,6 +1045,7 @@ def run_train_main():
         json.dump(LossRecord, f)
     with open(os.path.join(save_dir, 'eval', 'grad.json'),'w') as f:
         json.dump(GradRecord, f)
+    
 
 def main(_):
     run_sample_main()

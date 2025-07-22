@@ -1,11 +1,12 @@
-set -e
 
 Time=$(date +%Y-%m-%d_%H-%M-%S)
+#Time="2025-04-25_07-41-25"
 echo "Start time: ${Time}"
 SaveInterval=2
-SavePath="/root/paddlejob/workspace/env_run/output/outputs_cache/SRRL/model/lora"
-PromptFile="config/prompt/template1_train.json"
+SavePath="/data/panjiadong/project/NIPS25/outputs/B2-DiffuRL/model/lora"
+PromptFile="/data/panjiadong/project/NIPS25/B2-DiffuRL-main_xl/config/prompt/single3_train.json"
 RandomPrompt=1
+ExpName="exp_B2DiffuRL_b5_p3"
 Seed=300
 Beta1=1
 Beta2=1
@@ -17,13 +18,13 @@ SplitStepRight=20
 TrainEpoch=2
 AccStep=64
 LR=0.0001
-ModelVersion="CompVis/stable-diffusion-v1-4"
+ModelVersion="/data/panjiadong/model/stable-diffusion-xl-base-1.0"
 NumStep=20
 History_Cnt=8
 PosThreshold=0.5
 NegThreshold=-0.5
 SplitTime=5
-Dev_Id=0
+Dev_Id=2
 Total_resample_num=10
 
 CUDA_FALGS="--config.dev_id ${Dev_Id}"
@@ -45,7 +46,7 @@ do
     temp_seed=$((Seed+i))
     RANDOM_FLAGS="--config.seed ${temp_seed}"
     TRAIN_FLAGS="--config.train.save_interval ${SaveInterval} --config.train.num_epochs ${TrainEpoch} --config.train.beta1 ${Beta1} --config.train.beta2 ${Beta2} --config.train.gradient_accumulation_steps ${AccStep} --config.train.learning_rate ${LR}"
-    LORA_FLAGS=""s
+    LORA_FLAGS=""
     if [ $step != 0 ]; then
         minus_i=$((step-1))
         cur_epoch=${TrainEpoch}
@@ -62,8 +63,8 @@ do
     echo $RUN_FLAGS
     echo $LORA_FLAGS
 
-    python3 train.py $CUDA_FALGS $TRAIN_FLAGS $SAMPLE_FLAGS $RANDOM_FLAGS $EXP_FLAGS $RUN_FLAGS $LORA_FLAGS $SELECT_FLAGS $RESAMPLE_NUM
-    
+    python3 train_xl.py $CUDA_FALGS $TRAIN_FLAGS $SAMPLE_FLAGS $RANDOM_FLAGS $EXP_FLAGS $RUN_FLAGS $LORA_FLAGS $SELECT_FLAGS $RESAMPLE_NUM
+
     sleep 2
 done
 #done

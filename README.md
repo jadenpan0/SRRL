@@ -23,14 +23,17 @@ Install environments:
 pip install -r requirements.txt 
 ```
 
-Train:
+Train SD v1.4 with SRRL:
 
 ```bash
 bash train.sh 
 ```
 
+Train SD XL with SRRL:
 
-
+```bash
+bash train_xl.sh
+```
 
 
 
