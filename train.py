@@ -1,6 +1,6 @@
 import contextlib
 import os
-#os.environ["CUDA_VISIBLE_DEVICES"] = 1,2,6,7
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import datetime
 import time
 import sys
