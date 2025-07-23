@@ -17,10 +17,10 @@ Diffusion models have recently demonstrated exceptional performance in image gen
 
 ## Run
 
-Install environments:
+Create environments with conda:
 
 ``` bash
-pip install -r requirements.txt 
+conda env create -f environment.yml
 ```
 
 Train SD v1.4 with SRRL:
