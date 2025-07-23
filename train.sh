@@ -3,7 +3,7 @@ set -e
 Time=$(date +%Y-%m-%d_%H-%M-%S)
 echo "Start time: ${Time}"
 SaveInterval=2
-SavePath="/root/paddlejob/workspace/env_run/output/outputs_cache/SRRL/model_xl/lora"
+SavePath="Your Savepath"
 PromptFile="config/prompt/template1_train.json"
 RandomPrompt=1
 Seed=300
