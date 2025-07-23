@@ -36,6 +36,7 @@ bash train_xl.sh
 ```
 
 Hyperparameters are shown in `config/stage_process.py`.
+Reward models are in `rewards/rewards.py`
 
 
 
