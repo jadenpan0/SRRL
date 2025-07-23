@@ -8,11 +8,11 @@ numpy==1.25.2
 pandas==2.0.3
 opencv-python==4.8.1.78
 timm==0.6.13
-diffusers==0.24.0
+diffusers==0.26.0
 sentencepiece==0.1.99
-accelerate==0.25.0
+accelerate==0.32.0
 bitsandbytes==0.41.3.post2
-peft==0.7.1
+peft==0.10.0
 openai==1.8.0
 wandb==0.16.1
 matplotlib==3.7.2

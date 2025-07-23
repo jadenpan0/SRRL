@@ -1,10 +1,11 @@
+set -e
 
 Time=$(date +%Y-%m-%d_%H-%M-%S)
 #Time="2025-04-25_07-41-25"
 echo "Start time: ${Time}"
 SaveInterval=2
-SavePath="/data/panjiadong/project/NIPS25/outputs/B2-DiffuRL/model/lora"
-PromptFile="/data/panjiadong/project/NIPS25/B2-DiffuRL-main_xl/config/prompt/single3_train.json"
+SavePath="/root/paddlejob/workspace/env_run/output/outputs_cache/SRRL/model/lora"
+PromptFile="config/prompt/template1_train.json"
 RandomPrompt=1
 ExpName="exp_B2DiffuRL_b5_p3"
 Seed=300
@@ -18,7 +19,7 @@ SplitStepRight=20
 TrainEpoch=2
 AccStep=64
 LR=0.0001
-ModelVersion="/data/panjiadong/model/stable-diffusion-xl-base-1.0"
+ModelVersion="CompVis/stable-diffusion-xl-base-1.0"
 NumStep=20
 History_Cnt=8
 PosThreshold=0.5

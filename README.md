@@ -35,6 +35,8 @@ Train SD XL with SRRL:
 bash train_xl.sh
 ```
 
+Hyperparameters are shown in `config/stage_process.py`.
+
 
 
 ## Citation
