@@ -31,7 +31,7 @@ from peft.utils import get_peft_model_state_dict
 
 import numpy as np
 # from diffusion.pipeline_with_logprob import pipeline_with_logprob
-from diffusion.ddim_with_logprob import ddim_step_with_logprob, latents_decode
+from diffusion.ddim_with_logprob_xl import ddim_step_with_logprob, latents_decode
 import torch
 from functools import partial
 import tqdm
@@ -136,9 +136,15 @@ def run_sample_main():
         project_config=accelerator_config
     )
 
+    inference_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        inference_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        inference_dtype = torch.bfloat16
+
     # load scheduler, tokenizer and models.
     ####################################
-    pipeline = StableDiffusionXLPipeline.from_pretrained(config.pretrained.model, torch_dtype=torch.float16) # float16
+    pipeline = StableDiffusionXLPipeline.from_pretrained(config.pretrained.model, torch_dtype=inference_dtype) # float16
     inv_scheduler = DDIMInverseScheduler.from_config(pipeline.scheduler.config)
     # pipeline = StableDiffusionPipeline.from_single_file(config.pretrained.model, torch_dtype=torch.float16)
     # freeze parameters of models to save more memory

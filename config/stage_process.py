@@ -14,7 +14,7 @@ def get_config():
     # top-level logging directory for checkpoint saving.
     config.save_path = "./model/lora"
     # mixed precision training. options are "fp16", "bf16", and "no". half-precision speeds up training significantly.
-    config.mixed_precision = "bf16" # "fp16"
+    config.mixed_precision = "fp16" # "fp16"
     #config.mixed_precision = "bf16" 
     # allow tf32 on Ampere GPUs, which can speed up training.
     config.allow_tf32 = True # False # True
