@@ -16,7 +16,7 @@ import open_clip
 import numpy as np
 from utils.utils import seed_everything
 
-
+##CLIP Score
 def score_fn1(ground, img_dir, save_dir, config): 
     unique_id = config.exp_name
 
