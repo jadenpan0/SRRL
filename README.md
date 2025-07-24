@@ -17,7 +17,7 @@ Diffusion models have recently demonstrated exceptional performance in image gen
 
 ## Run
 
-Create environments with conda:
+Create a conda environment:
 
 ``` bash
 conda env create -f environment.yml
